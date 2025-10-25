@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Problem setup
+x_min, x_max = 0.0, np.pi/2
+N_data = 20
+x_data = np.linspace(x_min, x_max, N_data)
+
+# Exact solution
+def true_solution(x):
+    return np.sin(x)
+
+y_data_exact = true_solution(x_data)
+y_data_noisy = y_data_exact + 0.1 * np.random.randn(N_data)
+# Convert to tensors
+x_data_tensor = torch.tensor(x_data, dtype=torch.float32).view(-1,1)
+y_data_tensor = torch.tensor(y_data_exact, dtype=torch.float32).view(-1,1)
+
+# Define PINN model
+class PINN(nn.Module):
+    def __init__(self, n_hidden=40):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, n_hidden),
+            nn.Tanh(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.Tanh(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.Tanh(),
+            nn.Linear(n_hidden, 1)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+model = PINN(n_hidden=20)
+
+# Derivatives
+def derivative(y, x):
+    return torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y),
+                               create_graph=True)[0]
+
+def second_derivative(y, x):
+    dy_dx = derivative(y, x)
+    d2y_dx2 = derivative(dy_dx, x)
+    return d2y_dx2
+
+# Physics loss: y'' + y = 0
+def physics_loss(model, x):
+    x.requires_grad_(True)
+    y_pred = model(x)
+    d2y_dx2_pred = second_derivative(y_pred, x)
+    loss_ode = torch.mean((d2y_dx2_pred + y_pred)**2)
+    return loss_ode
+
+# Boundary condition losses: y(0)=0, y(pi/2)=1
+def boundary_loss(model):
+    x0 = torch.tensor([[0.0]], dtype=torch.float32)
+    x1 = torch.tensor([[np.pi/2]], dtype=torch.float32)
+
+    y0_pred = model(x0)
+    y1_pred = model(x1)
+
+    loss_bc = (y0_pred - 0.0).pow(2).mean() + (y1_pred - 1.0).pow(2).mean()
+    return loss_bc
+
+# Data loss (optional, can use exact data points)
+def data_loss(model, x_data, y_data):
+    y_pred = model(x_data)
+    return torch.mean((y_pred - y_data)**2)
+
+# Training setup
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+lambda_data = 1.0
+lambda_ode = 1.0
+lambda_bc = 1.0   # stronger weight on boundary conditions
+
+num_epochs = 3000
+print_every = 200
+
+# Training loop
+for epoch in range(num_epochs):
+    optimizer.zero_grad()
+    l_data = data_loss(model, x_data_tensor, y_data_tensor)
+    l_ode = physics_loss(model, x_data_tensor)
+    l_bc = boundary_loss(model)
+
+    # loss = lambda_data * l_data + lambda_ode * l_ode + lambda_bc * l_bc
+    loss = lambda_ode * l_ode + lambda_bc * l_bc
+
+
+    loss.backward()
+    optimizer.step()
+
+    if (epoch+1) % print_every == 0:
+        print(f"Epoch {epoch+1}/{num_epochs}, "
+              f"Total Loss={loss.item():.6f}, "
+              f"ODE Loss={l_ode.item():.6f}, "
+              f"BC Loss={l_bc.item():.6f}, "
+              # f"Data Loss={l_data.item():.6f}"
+              )
+
+# Evaluate trained model
+x_plot = (np.linspace(x_min, x_max, 100).reshape(-1,1)
+          .astype(np.float32))
+x_plot_tensor = torch.tensor(x_plot, requires_grad=True)
+y_pred_plot = model(x_plot_tensor).detach().numpy()
+y_true_plot = true_solution(x_plot)
+
+# Plot results
+plt.figure(figsize=(8,5))
+plt.plot(x_plot, y_true_plot, "k-", label="Exact Solution sin(x)")
+plt.plot(x_plot, y_pred_plot, "y--", label="PINN Prediction")
+# plt.scatter(x_data, y_data_noisy, color="red", s=10, label="Training Data (exact)")
+plt.xlabel("x")
+plt.ylabel("y(x)")
+plt.legend()
+plt.title("PINN for y'' + y = 0 with BCs")
+plt.grid(True)
+plt.show()
