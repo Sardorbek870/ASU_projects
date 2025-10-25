@@ -1,0 +1,100 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+# import pandas as pd
+
+
+# database = pd.read_csv("data.csv")
+
+# x_train = database["x"].iloc[:30]
+# y_train = database["y"].iloc[:30]
+x_min, x_max = 0.0, np.pi/2
+N_data = 20
+x_data = np.random.uniform(x_min, x_max, N_data)
+
+
+# Exact solution
+def true_solution(x):
+    return np.cos(x)
+
+y_data_exact = true_solution(x_data)
+y_data_noisy = y_data_exact + 0.1 * np.random.randn(N_data)
+# Convert to tensors
+x_train = torch.tensor(x_data, dtype=torch.float32).view(-1,1)
+y_train = torch.tensor(y_data_exact, dtype=torch.float32).view(-1,1)
+
+# x_train = torch.from_numpy(x_train.values).float().reshape(-1,1)
+# y_train = torch.from_numpy(y_train.values).float().reshape(-1,1)
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(1,50)
+        self.linear2 = torch.nn.Linear(50,25)
+        self.linear3 = torch.nn.Linear(25,12)
+        self.linear4 = torch.nn.Linear(12,3)
+        self.linear5 = torch.nn.Linear(3,1)
+
+        self.sigmoid = torch.nn.Sigmoid()
+        self.relu = torch.nn.ReLU()
+        self.tanh = torch.nn.Tanh()
+
+    def forward(self,x):
+        result1 = self.relu(self.linear1(x))
+        result2 = self.relu(self.linear2(result1))
+        result3 = self.relu(self.linear3(result2))
+        result4 = self.relu(self.linear4(result3))
+        y_pred = self.linear5(result4)
+        return y_pred
+
+model = Model()
+
+criterion = torch.nn.MSELoss(reduction="mean")
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+for epoch in range(2001):
+    y_pred = model(x_train)
+    loss = criterion(y_pred, y_train)
+
+    if epoch % 500 == 0:
+        print(f"Epoch : {epoch} | Loss : {loss}")
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+
+print(f"{'=' * 10} TEST {'=' * 10}")
+
+# x_test = np.random.uniform(x_min, x_max, N_data+10)
+# # x_test1 = torch.from_numpy(x_test.value()).float().reshape(-1,1)
+# x_test1 = torch.from_numpy(x_test).float().reshape(-1, 1)
+#
+# y_exact = np.cos(x_test1)
+# y_exact1 = torch.from_numpy(y_exact).float().reshape(-1,1)
+x_test  = np.sort(np.random.uniform(x_min, x_max, N_data + 10))
+x_test1 = torch.from_numpy(x_test).float().reshape(-1, 1)
+
+y_exact1 = torch.cos(x_test1)              # compute with Torch
+
+y_pred   = model(x_test1)
+
+
+
+for i in range(15):
+    print(f"x : {x_test1[i].item()} | y_prediction : {y_pred[i].item()} | y_exact : {y_exact1[i].item()}")
+loss = criterion(y_pred, y_exact1)
+
+print("Lost in test (MSE) : ", loss.item())
+
+plt.plot(x_test, y_exact1.detach().numpy(), "-o", label = "Exact values", color = "green")
+plt.plot(x_test, y_pred.detach().numpy(), "--o", label = "Prediction", color = "red")
+plt.title("N in training : 30 | N in testing : 15")
+plt.xlabel(f"Values of x", color = "red", size = 15)
+plt.ylabel("Values of cos(x)")
+plt.legend(loc = "best", fontsize = 12)
+plt.grid(color="blue", linestyle = ":", linewidth = 0.5)
+plt.show()
+
+
