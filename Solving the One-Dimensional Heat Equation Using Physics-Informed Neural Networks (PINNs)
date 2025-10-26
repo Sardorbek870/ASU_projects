@@ -1,0 +1,148 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+N_x = 40
+N_t = 40
+x = np.linspace(0,1,N_x)
+t = np.linspace(0,1,N_t)
+X, T = np.meshgrid(x,t)
+
+x_data = X.flatten()[:,None]
+t_data = T.flatten()[:,None]
+
+X_train = torch.tensor(np.hstack([x_data, t_data]), dtype=torch.float32)
+
+class PINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2,50),
+            nn.Tanh(),
+            nn.Linear(50,30),
+            nn.Tanh(),
+            nn.Linear(30,20),
+            nn.Tanh(),
+            nn.Linear(20,1)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+model = PINN()
+
+def derivative(y,x):
+    return torch.autograd.grad(y, x, grad_outputs=torch.ones_like(y),
+                               create_graph=True)[0]
+
+def second_derivative(y, x):
+    dy_dx = derivative(y, x)
+    d2y_dx2 = derivative(dy_dx, x)
+    return d2y_dx2
+
+def physics_loss(model, X_train):
+    x = X_train[:,0:1].clone().detach().requires_grad_(True)
+    t = X_train[:,1:2].clone().detach().requires_grad_(True)
+
+    X_input = torch.hstack([x,t])
+    u = model(X_input)
+    u_t = derivative(u,t)
+    u_xx = second_derivative(u,x)
+    loss = torch.mean((u_t - u_xx)**2)
+    return loss
+
+def initial_loss(model):
+    x0 = torch.linspace(0,1,50)[:,None].float()
+    t0 = torch.zeros_like(x0)
+    X_ic = torch.hstack([x0, t0])
+
+    # u_ic = (torch.sin(3 * np.pi * x0) * torch.cos(2 * np.pi * x0)).float()
+    u_ic = torch.sin(np.pi * x0).float()
+    u_pred = model(X_ic)
+    return torch.mean((u_pred - u_ic)**2)
+
+def boundary_loss(model):
+    t_bc = torch.linspace(0,1,50)[:, None].float()
+    x_left = torch.zeros_like(t_bc)
+    x_right = torch.ones_like(t_bc)
+
+    X_bc_left = torch.hstack([x_left, t_bc])
+    X_bc_right = torch.hstack([x_right, t_bc])
+
+    u_left = model(X_bc_left)
+    u_right = model(X_bc_right)
+    return torch.mean(u_left**2) + torch.mean(u_right**2)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+epochs = 4000
+
+for epoch in range(epochs):
+    optimizer.zero_grad()
+    loss_ic = initial_loss(model)
+    loss_pde = physics_loss(model, X_train)
+    loss_bc = boundary_loss(model)
+    loss = loss_ic + loss_bc + loss_pde
+    loss.backward()
+    optimizer.step()
+    if (epoch + 1) % 200 == 0:
+        print(f"Epoch {epoch + 1} / {epochs},   "
+              f"Total loss = {loss.item():.4e},   "
+              f"PDE_loss = {loss_pde.item():.4e},   "
+              f"IC_loss = {loss_ic.item():.4e},   "
+              f"BC_loss = {loss_bc.item():.4e} ")
+
+x_test = np.linspace(0,1,30)
+t_test = np.linspace(0,0.2,30)
+X_test, T_test = np.meshgrid(x_test, t_test)
+X_test_flat = np.hstack([X_test.flatten()[:,None], T_test.flatten()[:,None]])
+X_test_tensor = torch.tensor(X_test_flat, dtype=torch.float32)
+
+u_pred = model(X_test_tensor).detach().numpy().reshape(30,30)
+
+plt.figure(figsize=(8,5))
+plt.contourf(X_test, T_test, abs(u_pred), 50, cmap="jet")
+plt.colorbar(label="u(x,t)")
+plt.xlabel("x")
+plt.ylabel("t")
+plt.title("PINN solution of u_t = u_xx")
+plt.show()
+
+
+X_test_flat_tensor = torch.tensor(X_test_flat, dtype = torch.float32)
+x_vals = X_test_flat_tensor[:, 0:1].numpy()
+t_vals = X_test_flat_tensor[:, 1:2].numpy()
+
+# u_exact = 0.5 * (np.sin(np.pi * x_vals) * np.exp(-(np.pi)**2 * t_vals)+
+#                  np.sin(5 * np.pi * x_vals) * np.exp(-(5 * np.pi)**2 * t_vals))
+
+u_exact = np.sin(np.pi * x_vals) * np.exp(-1 * np.pi**2 * t_vals)
+
+u_pred = model(X_test_tensor).detach().numpy()
+
+u_exact = u_exact.reshape(30,30)
+u_pred = u_pred.reshape(30,30)
+
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+plt.contourf(X_test, T_test, u_pred, 50, cmap="jet")
+plt.colorbar(label="u_pred(x,t")
+plt.xlabel("x")
+plt.ylabel("t")
+plt.title("PINN Prediction")
+
+plt.subplot(1,2,2)
+plt.contourf(X_test, T_test, u_exact, 50, cmap="jet")
+plt.colorbar(label="u_exact(x,t)")
+plt.xlabel("x")
+plt.ylabel("t")
+plt.title("Exact Solution")
+plt.show()
+
+
+
+
+
+
+
+
