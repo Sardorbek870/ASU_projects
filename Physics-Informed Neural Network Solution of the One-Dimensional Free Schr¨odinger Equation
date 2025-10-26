@@ -1,0 +1,225 @@
+import random, os
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+
+SEED = 0
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+DEVICE = torch.device("cpu")
+
+eps  = 0.8
+b    = 0.35
+L    = 10.0
+Tmax = 1.0
+N_x, N_t = 30, 30
+
+
+x = np.linspace(-L, L, N_x); np.random.shuffle(x)
+t = np.linspace(0.0, Tmax, N_t); np.random.shuffle(t)
+X, T = np.meshgrid(x, t)
+X_train = torch.tensor(np.hstack([X.reshape(-1,1), T.reshape(-1,1)]),
+                       dtype=torch.float32, device=DEVICE)
+
+
+class Net1D(nn.Module):
+    def __init__(self, w=30, d=2):
+        super().__init__()
+        layers = [nn.Linear(2, w), nn.Tanh()]
+        for _ in range(d-1):
+            layers += [nn.Linear(w, w), nn.Tanh()]
+        layers += [nn.Linear(w, 1)]
+        self.backbone = nn.Sequential(*layers)
+    def forward(self, X):
+        x, t = X[:, :1], X[:, 1:]
+        return self.backbone(torch.hstack([x, t]))
+
+U_net, V_net = Net1D().to(DEVICE), Net1D().to(DEVICE)
+
+
+def d(y, x):   return torch.autograd.grad(y, x, torch.ones_like(y), create_graph=True)[0]
+def d2(y, x):  return d(d(y, x), x)
+
+
+def physics_loss(U_net, V_net, X_train, eps):
+    x = X_train[:, 0:1].clone().detach().requires_grad_(True)
+    t = X_train[:, 1:2].clone().detach().requires_grad_(True)
+    XT = torch.hstack([x, t])
+    u, v = U_net(XT), V_net(XT)
+    r1 = d(u, t) + 0.5*eps * d2(v, x)
+    r2 = d(v, t) - 0.5*eps * d2(u, x)
+    return (r1**2 + r2**2).mean()
+
+def initial_loss(U_net, V_net, L, eps, b, n_x=201, device="cpu"):
+    x0 = torch.linspace(-L, L, n_x, device=device)[:, None]
+    X0 = torch.hstack([x0, torch.zeros_like(x0)])
+    A = np.pi**(-0.25)
+    theta = 2.0*np.pi*b
+    env = torch.exp(-(x0**2) / (2.0*eps**2))
+    u0 = A * env * np.cos(theta)
+    v0 = A * env * np.sin(theta)
+    up, vp = U_net(X0), V_net(X0)
+    return ((up - u0)**2 + (vp - v0)**2).mean()
+
+def boundary_loss(U_net, V_net, L, Tmax, device):
+    tb = torch.linspace(0.0, Tmax, 200, device=device)[:, None]
+    XL = torch.hstack([torch.full_like(tb, -L), tb])
+    XR = torch.hstack([torch.full_like(tb,  L), tb])
+    return (U_net(XL)**2 + V_net(XL)**2).mean() + (U_net(XR)**2 + V_net(XR)**2).mean()
+
+def _trapz_x(dens_tx, x1d):
+    dx = x1d[1,0] - x1d[0,0]
+    return dx * (0.5*dens_tx[:,0] + dens_tx[:,1:-1].sum(dim=1) + 0.5*dens_tx[:,-1])
+
+def mass_loss(U_net, V_net, x1d, t1d, eps):
+    Xg = x1d.repeat(1, t1d.shape[0])
+    Tg = t1d.T.repeat(x1d.shape[0], 1)
+    XT = torch.stack([Xg.T.reshape(-1), Tg.T.reshape(-1)], dim=1).to(DEVICE)
+    u = U_net(XT).reshape(t1d.shape[0], x1d.shape[0])
+    v = V_net(XT).reshape(t1d.shape[0], x1d.shape[0])
+    dens = u**2 + v**2
+    M_t = _trapz_x(dens, x1d)
+    target = torch.as_tensor(eps, dtype=M_t.dtype, device=M_t.device)
+    return ((M_t - target)**2).mean()
+
+x_mass = torch.linspace(-L, L, 301, device=DEVICE)[:, None]
+t_mass = torch.linspace(0.0, Tmax, 50, device=DEVICE)[:, None]
+
+# ------------------ training ------------------
+CKPT_U = "pinn_with11_mass.pt"
+CKPT_V = "pinn_with21_mass.pt"
+CKPT_OPT = "pinn_with31_mass.pt"
+RESUME_TRAINING = True
+
+def save_all(opt):
+    torch.save(U_net.state_dict(), CKPT_U)
+    torch.save(V_net.state_dict(), CKPT_V)
+    torch.save({"opt": opt.state_dict()}, CKPT_OPT)
+
+def load_all(opt=None, strict=True):
+    U_net.load_state_dict(torch.load(CKPT_U, map_location=DEVICE), strict=strict)
+    V_net.load_state_dict(torch.load(CKPT_V, map_location=DEVICE), strict=strict)
+    if opt is not None and os.path.exists(CKPT_OPT):
+        s = torch.load(CKPT_OPT, map_location=DEVICE)
+        opt.load_state_dict(s["opt"])
+
+params = list(U_net.parameters()) + list(V_net.parameters())
+opt = torch.optim.Adam(params, lr=1e-3)
+epochs = 3000
+
+have_ckpt = os.path.exists(CKPT_U) and os.path.exists(CKPT_V)
+if have_ckpt:
+    print("Loading checkpoints...")
+    load_all(opt if RESUME_TRAINING else None)
+    if not RESUME_TRAINING:
+        U_net.eval(); V_net.eval()
+
+if (not have_ckpt) or RESUME_TRAINING:
+    print("Training...")
+    for ep in range(epochs+1):
+        opt.zero_grad()
+        lpde  = physics_loss(U_net, V_net, X_train, eps)
+        lic   = initial_loss(U_net, V_net, L, eps, b, device=DEVICE)
+        lbc   = boundary_loss(U_net, V_net, L, Tmax, DEVICE)
+        lmass = mass_loss(U_net, V_net, x_mass, t_mass, eps)
+        loss  = lpde + lic + lbc + lmass
+        loss.backward(); opt.step()
+        if (ep+1) % 300 == 0:
+            print(f"Ep {ep+1:4d}  Loss={loss.item():.3e}  PDE={lpde.item():.3e}  "
+                  f"IC={lic.item():.3e}  BC={lbc.item():.3e}  MASS={lmass.item():.3e}")
+    save_all(opt)
+    U_net.eval(); V_net.eval()
+
+# ------------------ evaluation & exact solution ------------------
+x_plot = np.linspace(-L, L, 120)
+t_plot = np.linspace(0.0, Tmax, 120)
+Xg, Tg = np.meshgrid(x_plot, t_plot)
+XT = torch.tensor(np.hstack([Xg.reshape(-1,1), Tg.reshape(-1,1)]),
+                  dtype=torch.float32, device=DEVICE)
+
+with torch.no_grad():
+    u_pred = U_net(XT).cpu().numpy().reshape(120, 120)
+    v_pred = V_net(XT).cpu().numpy().reshape(120, 120)
+
+xv = XT[:, 0:1].cpu().numpy()
+tv = XT[:, 1:2].cpu().numpy()
+A   = np.pi**(-0.25)
+den = (eps + 1j*tv)
+spread = np.sqrt(eps / den)
+phase0 = np.exp(1j * (2.0*np.pi*b))
+psi_exact = A * phase0 * spread * np.exp( -xv**2 / (2.0*eps*den) )
+u_exact = np.real(psi_exact).reshape(120, 120)
+v_exact = np.imag(psi_exact).reshape(120, 120)
+
+
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1);
+plt.contourf(Xg, Tg, v_pred, 60, cmap='jet');
+plt.colorbar()
+plt.title("Imaginary ψ (pred)")
+plt.subplot(1,2,2);
+plt.contourf(Xg, Tg, v_exact, 60, cmap='jet');
+plt.colorbar()
+plt.title("Imaginary ψ (exact)")
+plt.tight_layout();
+plt.xlabel(f"eps = {eps}, phi = {b}, epochs = {epochs}")
+plt.show()
+
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1);
+plt.contourf(Xg, Tg, u_pred, 60, cmap='jet');
+plt.colorbar()
+plt.title("Real ψ (pred)")
+plt.subplot(1,2,2);
+plt.contourf(Xg, Tg, u_exact, 60, cmap='jet');
+plt.colorbar()
+plt.title("Real ψ (exact)")
+plt.tight_layout();
+plt.xlabel(f"eps = {eps}, phi = {b}, epochs = {epochs}")
+plt.show()
+
+mag_pred  = np.sqrt(u_pred**2 + v_pred**2)
+mag_exact = np.sqrt(u_exact**2 + v_exact**2)
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1);
+plt.contourf(Xg, Tg, mag_pred, 60, cmap='jet');
+plt.colorbar();
+plt.title("|ψ| (pred)")
+plt.subplot(1,2,2);
+plt.contourf(Xg, Tg, mag_exact, 60, cmap='jet');
+plt.colorbar();
+plt.title("|ψ| (exact)")
+plt.tight_layout();
+plt.xlabel(f"eps = {eps}, phi = {b}, epochs = {epochs}")
+plt.show()
+
+dens_pred = mag_pred**2;
+dens_exact = mag_exact**2
+M_pred  = np.trapezoid(dens_pred,  x_plot, axis=1)
+M_exact = np.trapezoid(dens_exact, x_plot, axis=1)
+plt.figure(figsize=(8,4))
+plt.plot(t_plot, M_pred, label="M_pred")
+plt.plot(t_plot, M_exact, linestyle="--", label="M_exact")
+plt.axhline(eps, color='k', linestyle=':', label="M_target = ε")
+plt.xlabel("t");
+plt.ylabel("Mass M(t) = ∫|ψ|² dx")
+plt.title("Mass conservation")
+plt.legend();
+plt.tight_layout();
+plt.xlabel(f"eps = {eps}, phi = {b}, epochs = {epochs}")
+plt.show()
+
+# ---- Mean Absolute Errors ----
+u_mae = np.mean(np.abs(u_pred - u_exact))
+v_mae = np.mean(np.abs(v_pred - v_exact))
+mag_mae = np.mean(np.abs(mag_pred - mag_exact))
+mass_mae = np.mean(np.abs(M_pred - M_exact))
+
+print(f"Mean Absolute Error (Real part):      {u_mae:.3e}")
+print("Max Absolute Error (Real part):", np.max(np.abs(u_pred - u_exact)))
+print(f"Mean Absolute Error (Imaginary part): {v_mae:.3e}")
+print("Absolute Error (Imaginary part):", np.max(np.abs(v_pred - v_exact)))
+print(f"Mean Absolute Error (|ψ|):            {mag_mae:.3e}")
+print("Max Absolute Error (|ψ|):", np.max(np.abs(mag_pred - mag_exact)))
+print(f"Mean Absolute Error (Mass M(t)):      {mass_mae:.3e}")
+print("Max Absolute Error (Mass M(t)):", np.max(np.abs(M_pred - M_exact)))
